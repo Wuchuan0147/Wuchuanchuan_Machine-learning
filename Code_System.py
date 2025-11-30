@@ -1,8 +1,6 @@
 import streamlit as st
 import numpy as np
 import pandas as pd
-import matplotlib as mpl
-import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.model_selection import train_test_split, RandomizedSearchCV, StratifiedKFold, learning_curve, GridSearchCV
@@ -16,15 +14,15 @@ from sklearn.svm import SVC
 from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
 from scipy.stats import randint, uniform
-import time
 import warnings
 import joblib
 import os
 import io
 import base64
 from datetime import datetime
+import ast
 
-# Remove Chinese font settings and use default fonts
+# Remove all Chinese font settings and use default English fonts
 plt.rcParams.update({
     'font.size': 14, 'axes.labelsize': 14, 'xtick.labelsize': 13, 
     'ytick.labelsize': 13, 'legend.fontsize': 12, 'figure.figsize': (10, 8),
@@ -73,24 +71,26 @@ def initialize_session_state():
     if 'evaluation_results' not in st.session_state:
         st.session_state.evaluation_results = None
     if 'cv_folds' not in st.session_state:
-        st.session_state.cv_folds = 5  # Default 5-fold cross-validation
+        st.session_state.cv_folds = 5
     if 'data_preprocessed' not in st.session_state:
         st.session_state.data_preprocessed = False
     if 'models_trained' not in st.session_state:
         st.session_state.models_trained = False
     if 'evaluation_done' not in st.session_state:
         st.session_state.evaluation_done = False
+    if 'test_size' not in st.session_state:
+        st.session_state.test_size = 0.3  # Default test size
+    if 'random_state' not in st.session_state:
+        st.session_state.random_state = 42  # Default random state
 
-# Helper functions: Create download links
+# Helper functions
 def get_table_download_link(df, filename, link_text):
-    """Generate table download link"""
     csv = df.to_csv(index=True)
     b64 = base64.b64encode(csv.encode()).decode()
     href = f'<a href="data:file/csv;base64,{b64}" download="{filename}">{link_text}</a>'
     return href
 
 def get_image_download_link(fig, filename, link_text):
-    """Generate image download link"""
     buf = io.BytesIO()
     fig.savefig(buf, format='png', dpi=300, bbox_inches='tight')
     buf.seek(0)
@@ -99,18 +99,15 @@ def get_image_download_link(fig, filename, link_text):
     return href
 
 def create_evaluation_report(metrics_df, rank_df, models, feature_names, cv_folds):
-    """Create evaluation report"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     report_content = []
     
-    # Report title
     report_content.append(f"Zircon Mineralization Prediction Model Evaluation Report")
     report_content.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     report_content.append(f"Cross-validation folds: {cv_folds}")
     report_content.append("="*50)
     report_content.append("")
     
-    # Performance metrics
     report_content.append("Model Performance Metrics Summary:")
     report_content.append("")
     for model_name in metrics_df.index:
@@ -123,12 +120,10 @@ def create_evaluation_report(metrics_df, rank_df, models, feature_names, cv_fold
         report_content.append(f"  PR AUC: {metrics_df.loc[model_name, 'PR_AUC']:.4f}")
         report_content.append("")
     
-    # Ranking results
     report_content.append("Model Performance Ranking (1=Best):")
     for model_name in rank_df.index:
         report_content.append(f"{model_name}: Average Rank {rank_df.loc[model_name, 'Average_Rank']:.2f}")
     
-    # Best model
     best_model = rank_df['Average_Rank'].idxmin()
     report_content.append("")
     report_content.append(f"Best Model: {best_model}")
@@ -136,44 +131,49 @@ def create_evaluation_report(metrics_df, rank_df, models, feature_names, cv_fold
     
     return "\n".join(report_content), timestamp
 
-# Data loading and preprocessing function
-def load_and_preprocess_data(uploaded_file):
+# Helper function to parse hidden layer sizes
+def parse_hidden_layer_sizes(layer_str):
+    """Parse hidden layer sizes from string input like '100,50,25' to tuple (100, 50, 25)"""
     try:
-        # Read data
+        if not layer_str.strip():
+            return (100,)  # default value
+        layers = tuple(int(x.strip()) for x in layer_str.split(','))
+        return layers
+    except Exception as e:
+        st.error(f"Error parsing hidden layer sizes: {e}. Using default (100,)")
+        return (100,)
+
+# Data loading and preprocessing
+def load_and_preprocess_data(uploaded_file, test_size=0.3, random_state=42):
+    try:
         if uploaded_file.name.endswith('.xlsx'):
             data = pd.read_excel(uploaded_file)
         else:
             data = pd.read_csv(uploaded_file)
         
-        # Handle missing values
         if data.isnull().sum().any():
             data = data.dropna()
         
-        # Separate features and target
         X = data.iloc[:, :-1]
         feature_names = X.columns.tolist()
         y = data['Label']
         
-        # Split training and test sets
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.3, random_state=42, stratify=y)
+            X, y, test_size=test_size, random_state=random_state, stratify=y)
         
-        # Standardize features
         scaler = StandardScaler()
         X_train = scaler.fit_transform(X_train)
         X_test = scaler.transform(X_test)
         
-        # Save scaler
         joblib.dump(scaler, 'scaler.pkl')
         
         return X_train, X_test, y_train, y_test, feature_names, data.shape
     except Exception as e:
-        st.error(f"Data loading and preprocessing error: {e}")
+        st.error(f"Data loading error: {e}")
         return None, None, None, None, None, None
 
-# Model training function
+# Model training
 def train_models(X_train, y_train, selected_models, search_method, cv_folds, custom_params=None):
-    # Define model configurations
     base_models = {
         'XGBoost': {
             'model': XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42),
@@ -225,32 +225,35 @@ def train_models(X_train, y_train, selected_models, search_method, cv_folds, cus
             'random_params': {
                 'C': uniform(0.1, 10),
                 'penalty': ['l1', 'l2'],
-                'solver': ['liblinear']
+                'solver': ['liblinear', 'lbfgs', 'newton-cg', 'sag', 'saga']
             },
             'grid_params': {
                 'C': [0.1, 1, 10, 100],
                 'penalty': ['l1', 'l2'],
-                'solver': ['liblinear']
+                'solver': ['liblinear', 'lbfgs', 'newton-cg', 'sag', 'saga']
             }
         },
         'Neural Network': {
             'model': MLPClassifier(max_iter=1000, random_state=42),
             'random_params': {
-                'hidden_layer_sizes': [(50,), (100,), (50, 30), (100, 50)],
+                'hidden_layer_sizes': [(50,), (100,), (50, 30), (100, 50), (100, 50, 25)],
                 'alpha': uniform(0.0001, 0.1),
-                'activation': ['relu', 'tanh'],
-                'learning_rate_init': uniform(0.001, 0.01)
+                'activation': ['relu', 'tanh', 'logistic'],
+                'learning_rate_init': uniform(0.001, 0.01),
+                'solver': ['lbfgs', 'sgd', 'adam'],
+                'batch_size': ['auto', 32, 64, 128]
             },
             'grid_params': {
-                'hidden_layer_sizes': [(50,), (100,), (50, 30), (100, 50)],
+                'hidden_layer_sizes': [(50,), (100,), (50, 30), (100, 50), (100, 50, 25)],
                 'alpha': [0.0001, 0.001, 0.01, 0.1],
-                'activation': ['relu', 'tanh'],
-                'learning_rate_init': [0.001, 0.01, 0.1]
+                'activation': ['relu', 'tanh', 'logistic'],
+                'learning_rate_init': [0.001, 0.01, 0.1],
+                'solver': ['lbfgs', 'sgd', 'adam'],
+                'batch_size': ['auto', 32, 64, 128]
             }
         }
     }
     
-    # Define evaluation metrics
     scoring_metrics = {
         'accuracy': 'accuracy',
         'precision': 'precision_macro',
@@ -259,10 +262,7 @@ def train_models(X_train, y_train, selected_models, search_method, cv_folds, cus
         'roc_auc': 'roc_auc_ovo'
     }
     
-    # Only train selected models
     models = {name: config for name, config in base_models.items() if name in selected_models}
-    
-    # Train models
     trained_models = {}
     cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
     
@@ -270,11 +270,16 @@ def train_models(X_train, y_train, selected_models, search_method, cv_folds, cus
     status_text = st.empty()
     
     for i, (name, config) in enumerate(models.items()):
-        status_text.text(f"Training {name}... (using {cv_folds}-fold cross-validation)")
+        status_text.text(f"Training {name}... ({cv_folds}-fold CV)")
         
-        # Use custom parameters or default parameters
         if custom_params and name in custom_params:
             params = custom_params[name]
+            
+            # Handle hidden layer sizes parsing for Neural Network
+            if name == 'Neural Network' and 'hidden_layer_sizes' in params:
+                if isinstance(params['hidden_layer_sizes'], str):
+                    params['hidden_layer_sizes'] = parse_hidden_layer_sizes(params['hidden_layer_sizes'])
+            
             model = config['model']
             model.set_params(**params)
             model.fit(X_train, y_train)
@@ -287,7 +292,6 @@ def train_models(X_train, y_train, selected_models, search_method, cv_folds, cus
                 'cv_folds': cv_folds
             }
         else:
-            # Use search method
             if search_method == "Random Search":
                 search = RandomizedSearchCV(
                     config['model'], 
@@ -300,7 +304,7 @@ def train_models(X_train, y_train, selected_models, search_method, cv_folds, cus
                     random_state=42,
                     return_train_score=True
                 )
-            else:  # Grid Search
+            else:
                 search = GridSearchCV(
                     config['model'], 
                     config['grid_params'], 
@@ -313,7 +317,6 @@ def train_models(X_train, y_train, selected_models, search_method, cv_folds, cus
             
             search.fit(X_train, y_train)
             
-            # Extract cross-validation performance metrics
             best_index = search.best_index_
             cv_metrics = {}
             for metric in scoring_metrics.keys():
@@ -325,7 +328,6 @@ def train_models(X_train, y_train, selected_models, search_method, cv_folds, cus
                         'std': search.cv_results_[std_key][best_index]
                     }
             
-            # Calculate training set performance metrics
             model = search.best_estimator_
             y_train_pred = model.predict(X_train)
             train_metrics = {
@@ -343,13 +345,10 @@ def train_models(X_train, y_train, selected_models, search_method, cv_folds, cus
                 'cv_folds': cv_folds
             }
         
-        # Save model
         model_filename = f"{name.replace(' ', '_')}_model.pkl"
         joblib.dump(model_dict, model_filename)
         
         trained_models[name] = model_dict
-        
-        # Update progress bar
         progress_bar.progress((i + 1) / len(models))
     
     status_text.text("Training completed!")
@@ -363,31 +362,29 @@ def plot_confusion_matrices(models, X_train, X_test, y_train, y_test):
     for model_name, model_dict in models.items():
         model = model_dict['model']
         
-        # Training set confusion matrix
         y_train_pred = model.predict(X_train)
         cm_train = confusion_matrix(y_train, y_train_pred)
         
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
         
         sns.heatmap(cm_train, annot=True, fmt='d', cmap='Blues', 
-                    xticklabels=['Non-mineralized', 'Mineralized'],
-                    yticklabels=['Non-mineralized', 'Mineralized'],
+                    xticklabels=['Class 0', 'Class 1'],
+                    yticklabels=['Class 0', 'Class 1'],
                     annot_kws={"size": 14},
                     cbar=False, ax=ax1)
-        ax1.set_title(f'{model_name} - Training Set Confusion Matrix', fontsize=14)
+        ax1.set_title(f'{model_name} - Training Set', fontsize=14)
         ax1.set_ylabel('True Label', fontsize=12)
         ax1.set_xlabel('Predicted Label', fontsize=12)
         
-        # Test set confusion matrix
         y_test_pred = model.predict(X_test)
         cm_test = confusion_matrix(y_test, y_test_pred)
         
         sns.heatmap(cm_test, annot=True, fmt='d', cmap='Blues', 
-                   xticklabels=['Non-mineralized', 'Mineralized'],
-                    yticklabels=['Non-mineralized', 'Mineralized'],
+                   xticklabels=['Class 0', 'Class 1'],
+                    yticklabels=['Class 0', 'Class 1'],
                     annot_kws={"size": 14},
                     cbar=False, ax=ax2)
-        ax2.set_title(f'{model_name} - Test Set Confusion Matrix', fontsize=14)
+        ax2.set_title(f'{model_name} - Test Set', fontsize=14)
         ax2.set_ylabel('True Label', fontsize=12)
         ax2.set_xlabel('Predicted Label', fontsize=12)
         
@@ -401,7 +398,7 @@ def plot_confusion_matrices(models, X_train, X_test, y_train, y_test):
 # Plot ROC curves
 def plot_roc_curves(models, X_test, y_test):
     plt.figure(figsize=(10, 8))
-    plt.plot([0, 1], [0, 1], 'k--', alpha=0.7, label='Random Guessing')
+    plt.plot([0, 1], [0, 1], 'k--', alpha=0.7, label='Random')
     
     for model_name, model_dict in models.items():
         model = model_dict['model']
@@ -413,8 +410,8 @@ def plot_roc_curves(models, X_test, y_test):
     
     plt.xlim([-0.02, 1.02])
     plt.ylim([-0.02, 1.02])
-    plt.xlabel('False Positive Rate (FPR)', fontsize=12)
-    plt.ylabel('True Positive Rate (TPR)', fontsize=12)
+    plt.xlabel('False Positive Rate', fontsize=12)
+    plt.ylabel('True Positive Rate', fontsize=12)
     plt.title('ROC Curves', fontsize=16)
     plt.legend(loc='lower right', fontsize=12)
     plt.grid(True, alpha=0.3)
@@ -428,9 +425,8 @@ def plot_roc_curves(models, X_test, y_test):
 def plot_pr_curves(models, X_test, y_test):
     plt.figure(figsize=(10, 8))
     
-    # Add random baseline
     random_precision = sum(y_test) / len(y_test)
-    plt.plot([0, 1], [random_precision, random_precision], 'k--', alpha=0.7, label='Random Guessing')
+    plt.plot([0, 1], [random_precision, random_precision], 'k--', alpha=0.7, label='Random')
     
     for model_name, model_dict in models.items():
         model = model_dict['model']
@@ -459,13 +455,10 @@ def plot_feature_importance(models, feature_names):
     for model_name, model_dict in models.items():
         model = model_dict['model']
         
-        # Skip logistic regression model
         if model_name == 'Logistic Regression':
             continue
             
-        # Handle different model feature importance
         if hasattr(model, 'feature_importances_'):
-            # Tree models
             importances = model.feature_importances_
             indices = np.argsort(importances)[::-1]
             
@@ -476,7 +469,6 @@ def plot_feature_importance(models, feature_names):
             plt.xlim([-1, len(importances)])
             plt.ylabel("Importance Score", fontsize=12)
             
-            # Add value labels
             for bar in bars:
                 height = bar.get_height()
                 plt.text(bar.get_x() + bar.get_width()/2., height,
@@ -489,7 +481,6 @@ def plot_feature_importance(models, feature_names):
             plt.close()
             
         elif hasattr(model, 'coef_'):
-            # Linear models (except logistic regression)
             coef = model.coef_[0]
             indices = np.argsort(np.abs(coef))[::-1]
             
@@ -498,9 +489,8 @@ def plot_feature_importance(models, feature_names):
             bars = plt.bar(range(len(coef)), np.abs(coef)[indices], align="center", color='salmon')
             plt.xticks(range(len(coef)), [feature_names[i] for i in indices], rotation=90, fontsize=12)
             plt.xlim([-1, len(coef)])
-            plt.ylabel("Coefficient Absolute Value", fontsize=12)
+            plt.ylabel("Coefficient Value", fontsize=12)
             
-            # Add value labels
             for bar in bars:
                 height = bar.get_height()
                 plt.text(bar.get_x() + bar.get_width()/2., height,
@@ -514,39 +504,31 @@ def plot_feature_importance(models, feature_names):
     
     return figures
 
-# Performance metric ranking system
+# Performance ranking
 def calculate_model_ranks(metrics_df):
-    # Create ranking copy
     rank_df = metrics_df.copy()
     
-    # Calculate ranking for each metric (1=best)
     for column in rank_df.columns:
-        # All metrics are better when larger
         rank_df[column] = rank_df[column].rank(ascending=False)
     
-    # Calculate average ranking
     rank_df['Average_Rank'] = rank_df.mean(axis=1)
-    
-    # Sort by average ranking
     rank_df = rank_df.sort_values(by='Average_Rank')
     
     return rank_df
 
 # Evaluation function
 def evaluate_and_visualize(models, X_train, X_test, y_train, y_test, feature_names, cv_folds):
-    # Store evaluation metrics
     metrics = []
     
-    st.subheader("Model Best Parameters and Performance Summary")
+    st.subheader("Model Parameters and Performance Summary")
     
     for model_name, model_dict in models.items():
         with st.expander(f"{model_name} Details"):
             st.write(f"**Best Parameters:** {model_dict['best_params']}")
-            st.write(f"**Cross-validation Folds:** {model_dict.get('cv_folds', cv_folds)}")
+            st.write(f"**CV Folds:** {model_dict.get('cv_folds', cv_folds)}")
             
-            # Print cross-validation metrics
             if 'cv_metrics' in model_dict and model_dict['cv_metrics']:
-                st.write("**Cross-validation Performance Metrics:**")
+                st.write("**Cross-validation Metrics:**")
                 cv_data = []
                 for metric, value in model_dict['cv_metrics'].items():
                     cv_data.append({
@@ -556,9 +538,8 @@ def evaluate_and_visualize(models, X_train, X_test, y_train, y_test, feature_nam
                     })
                 st.table(pd.DataFrame(cv_data))
             
-            # Print training set performance metrics
             if 'train_metrics' in model_dict and model_dict['train_metrics']:
-                st.write("**Training Set Performance Metrics:**")
+                st.write("**Training Metrics:**")
                 train_data = []
                 for metric, value in model_dict['train_metrics'].items():
                     train_data.append({
@@ -570,33 +551,27 @@ def evaluate_and_visualize(models, X_train, X_test, y_train, y_test, feature_nam
     st.subheader("Confusion Matrices")
     confusion_figures = plot_confusion_matrices(models, X_train, X_test, y_train, y_test)
     
-    st.subheader("Test Set Performance Metrics")
+    st.subheader("Test Set Performance")
     for model_name, model_dict in models.items():
         model = model_dict['model']
         
-        # Test set predictions
         y_test_pred = model.predict(X_test)
         
-        # Ensure model supports probability prediction
         if hasattr(model, "predict_proba"):
             y_prob = model.predict_proba(X_test)[:, 1]
         else:
-            # For models that don't support probability prediction, use decision function
             y_prob = model.decision_function(X_test)
         
-        # Calculate test set metrics
         test_accuracy = accuracy_score(y_test, y_test_pred)
         test_precision = precision_score(y_test, y_test_pred, average='weighted')
         test_recall = recall_score(y_test, y_test_pred, average='weighted')
         test_f1 = f1_score(y_test, y_test_pred, average='weighted')
         
-        # Calculate ROC AUC
         if hasattr(model, "predict_proba") or hasattr(model, "decision_function"):
             roc_auc = roc_auc_score(y_test, y_prob)
         else:
-            roc_auc = 0.5  # Cannot calculate ROC AUC
+            roc_auc = 0.5
         
-        # Calculate PR AUC
         try:
             avg_precision = average_precision_score(y_test, y_prob)
         except:
@@ -612,36 +587,28 @@ def evaluate_and_visualize(models, X_train, X_test, y_train, y_test, feature_nam
             'PR_AUC': avg_precision
         })
         
-        # Display test set classification report
-        with st.expander(f"{model_name} Test Set Classification Report"):
-            st.text(classification_report(y_test, y_test_pred, target_names=['Non-mineralized', 'Mineralized']))
+        with st.expander(f"{model_name} Classification Report"):
+            st.text(classification_report(y_test, y_test_pred, target_names=['Class 0', 'Class 1']))
     
-    # Create metrics dataframe
     metrics_df = pd.DataFrame(metrics).set_index('Model')
-    
-    # Calculate rankings
     rank_df = calculate_model_ranks(metrics_df)
     
-    # Display metrics and rankings
     col1, col2 = st.columns(2)
     
     with col1:
-        st.write("**Model Test Set Performance Metrics:**")
+        st.write("**Performance Metrics:**")
         st.dataframe(metrics_df.style.format("{:.4f}"))
     
     with col2:
-        st.write("**Model Performance Ranking (1=Best):**")
+        st.write("**Model Ranking (1=Best):**")
         st.dataframe(rank_df.style.format("{:.2f}"))
     
-    # Select best model (lowest average rank)
     best_model_name = rank_df['Average_Rank'].idxmin()
     best_model = models[best_model_name]['model']
-    st.success(f"**Best Model: {best_model_name}** (Average Rank {rank_df.loc[best_model_name, 'Average_Rank']:.2f})")
+    st.success(f"**Best Model: {best_model_name}** (Avg Rank {rank_df.loc[best_model_name, 'Average_Rank']:.2f})")
     
-    # Save best model
     joblib.dump(best_model, 'best_model.pkl')
     
-    # Visualization
     st.subheader("ROC Curves")
     roc_fig = plot_roc_curves(models, X_test, y_test)
     
@@ -651,7 +618,6 @@ def evaluate_and_visualize(models, X_train, X_test, y_train, y_test, feature_nam
     st.subheader("Feature Importance")
     feature_figures = plot_feature_importance(models, feature_names)
     
-    # Save evaluation results
     evaluation_results = {
         'metrics_df': metrics_df,
         'rank_df': rank_df,
@@ -671,138 +637,120 @@ def evaluate_and_visualize(models, X_train, X_test, y_train, y_test, feature_nam
 
 # Prediction function
 def predict_new_dataset(models, uploaded_file, selected_models_for_prediction):
-    st.subheader("New Dataset Prediction Results")
+    st.subheader("New Dataset Prediction")
     
-    # Load new dataset
     try:
         if uploaded_file.name.endswith('.xlsx'):
             new_data = pd.read_excel(uploaded_file)
         else:
             new_data = pd.read_csv(uploaded_file)
     except Exception as e:
-        st.error(f"File reading error: {e}")
+        st.error(f"File error: {e}")
         return
     
-    # Check and handle missing values
     if new_data.isnull().sum().any():
-        st.warning("Missing values found in new dataset, removing rows with missing values...")
+        st.warning("Missing values found, removing rows...")
         new_data = new_data.dropna()
     
-    # Separate features and labels (if labels exist)
     if 'Label' in new_data.columns:
         X_new = new_data.drop('Label', axis=1)
         y_new = new_data['Label']
         has_labels = True
-        st.info("Label column found, will calculate performance metrics.")
+        st.info("Label column found.")
     else:
         X_new = new_data
         has_labels = False
-        st.info("No 'Label' column found, only prediction will be performed.")
+        st.info("No Label column, prediction only.")
     
-    # Load previously saved scaler
     try:
         scaler = joblib.load('scaler.pkl')
         X_new_scaled = scaler.transform(X_new)
-        st.success("Using saved scaler to standardize data.")
+        st.success("Data standardized.")
     except FileNotFoundError:
-        st.error("Error: Scaler file 'scaler.pkl' not found, please train models first.")
+        st.error("Scaler not found, train models first.")
         return
     
-    # Predict for each selected model
     for model_name in selected_models_for_prediction:
         if model_name not in models:
-            st.warning(f"Model {model_name} not trained, skipping prediction.")
+            st.warning(f"{model_name} not trained, skipping.")
             continue
             
-        st.subheader(f"{model_name} Prediction Results")
+        st.subheader(f"{model_name} Results")
         model_dict = models[model_name]
         model = model_dict['model']
         
         try:
-            # Make predictions
             y_pred = model.predict(X_new_scaled)
             
-            # Try to get prediction confidence
-            confidence = np.ones(len(y_pred))  # Default value
+            confidence = np.ones(len(y_pred))
             if hasattr(model, "predict_proba"):
                 confidence = np.max(model.predict_proba(X_new_scaled), axis=1)
             elif hasattr(model, "decision_function"):
                 decision_values = model.decision_function(X_new_scaled)
-                confidence = 1 / (1 + np.exp(-decision_values))  # Convert to probability
+                confidence = 1 / (1 + np.exp(-decision_values))
             
-            # Create prediction results DataFrame
             prediction_df = pd.DataFrame({
                 'Predicted_Label': y_pred,
                 'Prediction_Confidence': confidence
             })
             
-            # Add original features
             prediction_df = pd.concat([X_new.reset_index(drop=True), prediction_df], axis=1)
             
-            # Save prediction results
             prediction_filename = f"{model_name.replace(' ', '_')}_predictions.csv"
             prediction_df.to_csv(prediction_filename, index=False)
             
-            # Display prediction results
-            st.write(f"**Prediction Results Sample:**")
+            st.write(f"**Prediction Sample:**")
             st.dataframe(prediction_df.head())
             
-            # Download prediction results
             csv = prediction_df.to_csv(index=False)
             st.download_button(
-                label=f"Download {model_name} Prediction Results",
+                label=f"Download {model_name} Results",
                 data=csv,
                 file_name=prediction_filename,
                 mime="text/csv"
             )
             
-            # If true labels exist, calculate performance metrics
             if has_labels:
-                # Calculate performance metrics
                 accuracy = accuracy_score(y_new, y_pred)
                 precision = precision_score(y_new, y_pred, average='weighted')
                 recall = recall_score(y_new, y_pred, average='weighted')
                 f1 = f1_score(y_new, y_pred, average='weighted')
                 
-                # Display performance metrics
                 col1, col2, col3, col4 = st.columns(4)
                 col1.metric("Accuracy", f"{accuracy:.4f}")
                 col2.metric("Precision", f"{precision:.4f}")
                 col3.metric("Recall", f"{recall:.4f}")
                 col4.metric("F1 Score", f"{f1:.4f}")
                 
-                # Plot confusion matrix
                 cm = confusion_matrix(y_new, y_pred)
                 
                 fig, ax = plt.subplots(figsize=(8, 6))
                 sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                            xticklabels=['Non-mineralized', 'Mineralized'],
-                            yticklabels=['Non-mineralized', 'Mineralized'],
+                            xticklabels=['Class 0', 'Class 1'],
+                            yticklabels=['Class 0', 'Class 1'],
                             annot_kws={"size": 14}, ax=ax)
-                ax.set_title(f'{model_name} - New Dataset Confusion Matrix', fontsize=14)
+                ax.set_title(f'{model_name} - New Data', fontsize=14)
                 ax.set_ylabel('True Label', fontsize=12)
                 ax.set_xlabel('Predicted Label', fontsize=12)
                 plt.tight_layout()
                 st.pyplot(fig)
                 plt.close()
                 
-                # Display classification report
-                with st.expander(f"{model_name} New Dataset Classification Report"):
-                    st.text(classification_report(y_new, y_pred, target_names=['Non-mineralized', 'Mineralized']))
+                with st.expander(f"{model_name} Classification Report"):
+                    st.text(classification_report(y_new, y_pred, target_names=['Class 0', 'Class 1']))
             else:
-                # Visualize prediction results distribution
                 fig, ax = plt.subplots(figsize=(10, 6))
                 sns.countplot(x='Predicted_Label', data=prediction_df, ax=ax)
-                ax.set_title(f'{model_name} - Prediction Results Distribution', fontsize=16)
+                ax.set_title(f'{model_name} - Prediction Distribution', fontsize=16)
                 ax.set_xlabel('Predicted Label', fontsize=12)
-                ax.set_ylabel('Sample Count', fontsize=12) 
-                ax.set_xticklabels(['Non-mineralized', 'Mineralized'])
+                ax.set_ylabel('Count', fontsize=12) 
+                ax.set_xticklabels(['Class 0', 'Class 1'])
                 plt.tight_layout()
                 st.pyplot(fig)
                 plt.close()
                 
         except Exception as e:
-            st.error(f"Error processing {model_name}: {str(e)}")
+            st.error(f"Error with {model_name}: {str(e)}")
 
 # Load saved models
 def load_saved_models():
@@ -820,26 +768,24 @@ def load_saved_models():
             try:
                 model_dict = joblib.load(filename)
                 saved_models[model_name] = model_dict
-                st.sidebar.success(f"✅ {model_name} loaded")
+                st.sidebar.success(f"✅ {model_name}")
             except Exception as e:
-                st.sidebar.warning(f"⚠️ {model_name} loading failed: {e}")
+                st.sidebar.warning(f"⚠️ {model_name}: {e}")
         else:
-            st.sidebar.info(f"📝 {model_name} not trained")
+            st.sidebar.info(f"📝 {model_name}")
     
     return saved_models
 
-# Download evaluation results function
+# Download results
 def download_evaluation_results(evaluation_results, feature_names):
     if not evaluation_results:
-        st.warning("No evaluation results to download, please perform model evaluation first.")
+        st.warning("No results to download.")
         return
     
-    st.subheader("📥 Download Evaluation Results")
+    st.subheader("📥 Download Results")
     
-    # Create timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    # Create evaluation report
     report_content, report_timestamp = create_evaluation_report(
         evaluation_results['metrics_df'],
         evaluation_results['rank_df'],
@@ -851,87 +797,77 @@ def download_evaluation_results(evaluation_results, feature_names):
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        # Download performance metrics tables
-        st.markdown("### Performance Metrics Tables")
+        st.markdown("### Tables")
         st.markdown(get_table_download_link(
             evaluation_results['metrics_df'], 
-            f"model_metrics_{timestamp}.csv", 
-            "📊 Download Performance Metrics Table"
+            f"metrics_{timestamp}.csv", 
+            "📊 Metrics Table"
         ), unsafe_allow_html=True)
         
         st.markdown(get_table_download_link(
             evaluation_results['rank_df'], 
-            f"model_ranks_{timestamp}.csv", 
-            "🏆 Download Model Ranking Table"
+            f"ranks_{timestamp}.csv", 
+            "🏆 Ranking Table"
         ), unsafe_allow_html=True)
     
     with col2:
-        # Download visualization charts
-        st.markdown("### Visualization Charts")
+        st.markdown("### Charts")
         
-        # ROC curve
         if 'roc_fig' in evaluation_results:
             st.markdown(get_image_download_link(
                 evaluation_results['roc_fig'],
-                f"roc_curves_{timestamp}.png",
-                "📈 Download ROC Curves"
+                f"roc_{timestamp}.png",
+                "📈 ROC Curves"
             ), unsafe_allow_html=True)
         
-        # PR curve
         if 'pr_fig' in evaluation_results:
             st.markdown(get_image_download_link(
                 evaluation_results['pr_fig'],
-                f"pr_curves_{timestamp}.png",
-                "📊 Download PR Curves"
+                f"pr_{timestamp}.png",
+                "📊 PR Curves"
             ), unsafe_allow_html=True)
     
     with col3:
-        # Download confusion matrices and feature importance
-        st.markdown("### Model Detailed Charts")
+        st.markdown("### Model Charts")
         
-        # Confusion matrices
         if 'confusion_figures' in evaluation_results:
             for model_name, fig in evaluation_results['confusion_figures'].items():
                 st.markdown(get_image_download_link(
                     fig,
-                    f"confusion_matrix_{model_name}_{timestamp}.png",
-                    f"🎯 Download {model_name} Confusion Matrix"
+                    f"confusion_{model_name}_{timestamp}.png",
+                    f"🎯 {model_name} Confusion"
                 ), unsafe_allow_html=True)
         
-        # Feature importance
         if 'feature_figures' in evaluation_results:
             for model_name, fig in evaluation_results['feature_figures'].items():
                 st.markdown(get_image_download_link(
                     fig,
-                    f"feature_importance_{model_name}_{timestamp}.png",
-                    f"🔍 Download {model_name} Feature Importance"
+                    f"features_{model_name}_{timestamp}.png",
+                    f"🔍 {model_name} Features"
                 ), unsafe_allow_html=True)
     
-    # Download complete evaluation report
     st.markdown("---")
-    st.markdown("### Complete Evaluation Report")
+    st.markdown("### Full Report")
     st.download_button(
-        label="📄 Download Complete Evaluation Report (TXT)",
+        label="📄 Full Report (TXT)",
         data=report_content,
-        file_name=f"model_evaluation_report_{timestamp}.txt",
+        file_name=f"report_{timestamp}.txt",
         mime="text/plain"
     )
     
-    # Display report preview
-    with st.expander("Preview Evaluation Report"):
+    with st.expander("Report Preview"):
         st.text(report_content)
 
 # Main application
 def main():
     initialize_session_state()
     
-    st.title("🔬 Zircon Mineralization Prediction System")
+    st.title("🔬 Zircon Mineralization Prediction")
     st.markdown("---")
     
-    # Sidebar navigation - directly display five functional areas
-    st.sidebar.title("🚀 Functional Area Navigation")
+    # Sidebar navigation
+    st.sidebar.title("🚀 Navigation")
     
-    # Functional area buttons
     if st.sidebar.button("🏠 Home", use_container_width=True):
         st.session_state.current_page = "Home"
     
@@ -947,123 +883,146 @@ def main():
     if st.sidebar.button("🔮 Predict New Data", use_container_width=True):
         st.session_state.current_page = "Predict New Data"
     
-    if st.sidebar.button("⚙️ Parameter Settings", use_container_width=True):
+    if st.sidebar.button("⚙️ Parameters", use_container_width=True):
         st.session_state.current_page = "Parameter Settings"
     
     st.sidebar.markdown("---")
     
-    # Cross-validation settings
-    st.sidebar.subheader("🔧 Cross-validation Settings")
+    # Cross-validation
+    st.sidebar.subheader("🔧 Cross-validation")
     cv_folds = st.sidebar.radio(
-        "Select Cross-validation Folds",
+        "CV Folds",
         [5, 10],
         index=0 if st.session_state.cv_folds == 5 else 1,
         key="cv_folds_sidebar"
     )
     st.session_state.cv_folds = cv_folds
-    st.sidebar.info(f"Current: {cv_folds}-fold cross-validation")
+    st.sidebar.info(f"Current: {cv_folds}-fold")
     
     st.sidebar.markdown("---")
     
-    # Load saved models
-    st.sidebar.subheader("📁 Saved Models")
+    # Load models
+    st.sidebar.subheader("📁 Models")
     saved_models = load_saved_models()
     if saved_models:
         st.session_state.trained_models.update(saved_models)
-        st.sidebar.success(f"Loaded {len(saved_models)} models")
+        st.sidebar.success(f"Loaded: {len(saved_models)}")
     
-    # Clear data button
+    # Clear data
     st.sidebar.markdown("---")
-    if st.sidebar.button("🗑️ Clear All Data", type="secondary"):
-        # Reset all states
+    if st.sidebar.button("🗑️ Clear All", type="secondary"):
         for key in list(st.session_state.keys()):
             del st.session_state[key]
-        # Reinitialize
         initialize_session_state()
         st.rerun()
     
-    # Display current status
+    # Status
     st.sidebar.markdown("---")
-    st.sidebar.subheader("📊 Current Status")
+    st.sidebar.subheader("📊 Status")
     
     status_col1, status_col2 = st.sidebar.columns(2)
     with status_col1:
-        st.metric("Data Status", "✅" if st.session_state.data_loaded else "❌")
+        st.metric("Data", "✅" if st.session_state.data_loaded else "❌")
     with status_col2:
         trained_count = len(st.session_state.trained_models)
-        st.metric("Model Count", f"{trained_count}/5")
+        st.metric("Models", f"{trained_count}/5")
     
-    # Display content based on current page
+    # Page content
     current_page = st.session_state.current_page
     
     # Home page
     if current_page == "Home":
-        st.header("Welcome to Zircon Mineralization Prediction System")
+        st.header("Zircon Mineralization Prediction System")
         st.markdown("""
-        ### 🎯 System Functions
+        ### System Features
         
-        **📊 Data Upload** - Upload zircon data files and perform preprocessing
+        **📊 Data Upload** - Upload and preprocess zircon data
         
-        **🤖 Model Training** - Select and train machine learning models
+        **🤖 Model Training** - Train machine learning models
         - XGBoost
         - Random Forest  
         - SVM
         - Logistic Regression
         - Neural Network
         
-        **📈 Model Evaluation** - Evaluate model performance and visualize results
+        **📈 Model Evaluation** - Evaluate and visualize model performance
         
-        **🔮 Predict New Data** - Use trained models to predict new data
+        **🔮 Predict New Data** - Predict on new datasets
         
-        **⚙️ Parameter Settings** - Customize model parameters
+        **⚙️ Parameters** - Customize model parameters
         
-        ### 🚀 Usage Process
-        1. Upload your data in "Data Upload" page
-        2. Select models to train in "Model Training" page
-        3. View model performance in "Model Evaluation" page
-        4. Use models for prediction in "Predict New Data" page
+        ### Usage Steps
+        1. Upload data in "Data Upload"
+        2. Train models in "Model Training" 
+        3. Evaluate in "Model Evaluation"
+        4. Predict in "Predict New Data"
         
-        ### 💡 Tips
-        - Each functional area's operation results are preserved for comparison
-        - You can use "Clear All Data" in sidebar to start over anytime
-        - Trained models are automatically saved for future use
-        - Model evaluation results can be downloaded and saved
-        - You can select 5-fold or 10-fold cross-validation in sidebar
+        ### Tips
+        - Results are preserved between pages
+        - Use "Clear All" to restart
+        - Models are auto-saved
+        - Results can be downloaded
         """)
         
-        # Display current status
         col1, col2, col3 = st.columns(3)
         with col1:
             status = "✅ Loaded" if st.session_state.data_loaded else "❌ Not Loaded"
             st.metric("Data Status", status)
         with col2:
             trained_count = len(st.session_state.trained_models)
-            st.metric("Trained Models", f"{trained_count}/5")
+            st.metric("Models Trained", f"{trained_count}/5")
         with col3:
-            status = "✅ Completed" if st.session_state.training_complete else "⏳ Pending Training"
-            st.metric("Training Status", status)
+            status = "✅ Done" if st.session_state.training_complete else "⏳ Waiting"
+            st.metric("Training", status)
         
-        # Display cross-validation settings
-        st.info(f"Current Cross-validation Setting: **{st.session_state.cv_folds}-fold cross-validation**")
+        st.info(f"Cross-validation: **{st.session_state.cv_folds}-fold**")
+        st.info(f"Test set size: **{st.session_state.test_size*100}%**")
     
     # Data Upload page
     elif current_page == "Data Upload":
         st.header("📊 Data Upload")
-        st.markdown("Upload your zircon data files (supports Excel and CSV formats)")
+        st.markdown("Upload zircon data (Excel/CSV)")
         
-        # Display current status
         if st.session_state.data_loaded:
-            st.success("✅ Data loaded and preprocessing completed")
-            st.write(f"- Training set size: {st.session_state.X_train.shape[0]}")
-            st.write(f"- Test set size: {st.session_state.X_test.shape[0]}")
-            st.write(f"- Feature count: {len(st.session_state.feature_names)}")
+            st.success("✅ Data loaded")
+            st.write(f"- Train: {st.session_state.X_train.shape[0]}")
+            st.write(f"- Test: {st.session_state.X_test.shape[0]}")
+            st.write(f"- Features: {len(st.session_state.feature_names)}")
+            st.info(f"Test set size: **{st.session_state.test_size*100}%**")
+        
+        # Data split settings
+        st.subheader("Data Split Settings")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            test_size = st.slider(
+                "Test Set Size (%)", 
+                min_value=10, 
+                max_value=50, 
+                value=int(st.session_state.test_size * 100),
+                step=5,
+                help="Percentage of data to use for testing"
+            )
+            st.session_state.test_size = test_size / 100
+        
+        with col2:
+            random_state = st.number_input(
+                "Random State", 
+                min_value=0, 
+                max_value=100, 
+                value=st.session_state.random_state,
+                step=1,
+                help="Random seed for reproducible splits"
+            )
+            st.session_state.random_state = random_state
+        
+        st.info(f"Training set: **{(1-st.session_state.test_size)*100}%** | Test set: **{st.session_state.test_size*100}%**")
         
         uploaded_file = st.file_uploader("Select File", type=['xlsx', 'csv'])
         
         if uploaded_file is not None:
             st.session_state.uploaded_file = uploaded_file
             
-            # Display data information
             try:
                 if uploaded_file.name.endswith('.xlsx'):
                     data = pd.read_excel(uploaded_file)
@@ -1075,34 +1034,36 @@ def main():
                 
                 col1, col2 = st.columns(2)
                 with col1:
-                    st.write("**Data Information:**")
-                    st.write(f"- Data shape: {data.shape}")
-                    st.write(f"- Feature count: {data.shape[1]-1}")
-                    st.write(f"- Sample count: {data.shape[0]}")
+                    st.write("**Data Info:**")
+                    st.write(f"- Shape: {data.shape}")
+                    st.write(f"- Features: {data.shape[1]-1}")
+                    st.write(f"- Samples: {data.shape[0]}")
                 
                 with col2:
                     if 'Label' in data.columns:
-                        st.write("**Label Distribution:**")
+                        st.write("**Label Count:**")
                         label_counts = data['Label'].value_counts()
                         st.write(label_counts)
                 
                 if 'Label' in data.columns:
-                    # Visualize label distribution
                     fig, ax = plt.subplots(figsize=(8, 6))
                     label_counts = data['Label'].value_counts()
                     label_counts.plot(kind='bar', ax=ax)
                     ax.set_title('Label Distribution', fontsize=16)
                     ax.set_xlabel('Label', fontsize=12)
                     ax.set_ylabel('Count', fontsize=12)
-                    ax.set_xticklabels(['Non-mineralized', 'Mineralized'], rotation=0)
+                    ax.set_xticklabels(['Class 0', 'Class 1'], rotation=0)
                     plt.tight_layout()
                     st.pyplot(fig)
                     plt.close()
                 
-                # Preprocess data
-                if st.button("Start Data Preprocessing", type="primary"):
-                    with st.spinner("Preprocessing data..."):
-                        X_train, X_test, y_train, y_test, feature_names, data_shape = load_and_preprocess_data(uploaded_file)
+                if st.button("Preprocess Data", type="primary"):
+                    with st.spinner("Processing..."):
+                        X_train, X_test, y_train, y_test, feature_names, data_shape = load_and_preprocess_data(
+                            uploaded_file, 
+                            test_size=st.session_state.test_size,
+                            random_state=st.session_state.random_state
+                        )
                         
                         if X_train is not None:
                             st.session_state.X_train = X_train
@@ -1113,75 +1074,78 @@ def main():
                             st.session_state.data_loaded = True
                             st.session_state.data_preprocessed = True
                             
-                            st.success("Data preprocessing completed!")
-                            st.write(f"- Training set size: {X_train.shape[0]}")
-                            st.write(f"- Test set size: {X_test.shape[0]}")
-                            st.write(f"- Feature count: {len(feature_names)}")
-                            st.write(f"- Feature list: {', '.join(feature_names)}")
+                            st.success("Data processed!")
+                            st.write(f"- Training set: {X_train.shape[0]} samples ({(1-st.session_state.test_size)*100:.1f}%)")
+                            st.write(f"- Test set: {X_test.shape[0]} samples ({st.session_state.test_size*100:.1f}%)")
+                            st.write(f"- Features: {len(feature_names)}")
+                            
+                            # Show label distribution in train/test sets
+                            train_label_counts = pd.Series(y_train).value_counts()
+                            test_label_counts = pd.Series(y_test).value_counts()
+                            
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                st.write("**Training Set Labels:**")
+                                st.write(train_label_counts)
+                            with col2:
+                                st.write("**Test Set Labels:**")
+                                st.write(test_label_counts)
             except Exception as e:
-                st.error(f"Error processing file: {e}")
+                st.error(f"Error: {e}")
     
     # Model Training page
     elif current_page == "Model Training":
         st.header("🤖 Model Training")
         
-        # Display cross-validation settings
-        st.info(f"Current Cross-validation Setting: **{st.session_state.cv_folds}-fold cross-validation**")
+        st.info(f"CV: **{st.session_state.cv_folds}-fold**")
+        st.info(f"Test set size: **{st.session_state.test_size*100}%**")
         
         if not st.session_state.data_loaded:
-            st.warning("Please upload and preprocess data first!")
+            st.warning("Upload data first!")
             return
         
-        st.write("**Select models to train:**")
+        st.write("**Select models:**")
         
-        # Model selection
         model_options = ['XGBoost', 'Random Forest', 'SVM', 'Logistic Regression', 'Neural Network']
         selected_models = st.multiselect(
-            "Select Models",
+            "Models",
             model_options,
             default=model_options
         )
         
-        # Search method selection
         search_method = st.radio(
-            "Select Parameter Search Method",
+            "Search Method",
             ["Random Search", "Grid Search", "Custom Parameters"]
         )
         
-        # Display saved models
         if st.session_state.trained_models:
-            st.info(f"📁 Loaded {len(st.session_state.trained_models)} trained models")
+            st.info(f"📁 Loaded: {len(st.session_state.trained_models)} models")
             trained_list = list(st.session_state.trained_models.keys())
-            st.write(f"Trained models: {', '.join(trained_list)}")
+            st.write(f"Trained: {', '.join(trained_list)}")
         
-        # Training options
         col1, col2 = st.columns(2)
         with col1:
-            use_existing = st.checkbox("Use saved models (if available)", value=True)
+            use_existing = st.checkbox("Use existing models", value=True)
         with col2:
-            retrain = st.checkbox("Retrain selected models", value=False)
+            retrain = st.checkbox("Retrain selected", value=False)
         
-        # Training button
-        if st.button("Start Model Training", type="primary"):
+        if st.button("Train Models", type="primary"):
             if not selected_models:
-                st.error("Please select at least one model!")
+                st.error("Select at least one model!")
                 return
             
-            with st.spinner("Training models..."):
-                # Determine models to train
+            with st.spinner("Training..."):
                 models_to_train = selected_models
                 if use_existing and not retrain:
-                    # Exclude existing models
                     existing_models = list(st.session_state.trained_models.keys())
                     models_to_train = [model for model in selected_models if model not in existing_models]
                     
                     if not models_to_train:
-                        st.info("All selected models are already trained, using existing models.")
+                        st.info("Using existing models.")
                     else:
-                        st.info(f"Will train new models: {', '.join(models_to_train)}")
+                        st.info(f"New models: {', '.join(models_to_train)}")
                 
                 if models_to_train or retrain:
-                    # Get custom parameters
                     custom_params = {}
                     if search_method == "Custom Parameters":
                         custom_params = st.session_state.get('custom_params', {})
@@ -1195,29 +1159,26 @@ def main():
                         custom_params
                     )
                     
-                    # Update session state
                     st.session_state.trained_models.update(trained_models)
-                    st.success(f"Model training completed! Trained {len(trained_models)} models")
+                    st.success(f"Trained {len(trained_models)} models")
                 else:
-                    st.success("Using existing trained models")
+                    st.success("Using existing models")
     
     # Model Evaluation page
     elif current_page == "Model Evaluation":
         st.header("📈 Model Evaluation")
         
-        # Display cross-validation settings
-        st.info(f"Current Cross-validation Setting: **{st.session_state.cv_folds}-fold cross-validation**")
+        st.info(f"CV: **{st.session_state.cv_folds}-fold**")
+        st.info(f"Test set size: **{st.session_state.test_size*100}%**")
         
         if not st.session_state.trained_models:
-            st.warning("Please train models first!")
+            st.warning("Train models first!")
             return
         
-        # Display completed evaluation
         if st.session_state.evaluation_done:
-            st.success("✅ Model evaluation completed")
-            st.write("Previous evaluation results:")
+            st.success("✅ Evaluation done")
+            st.write("Previous results:")
             
-            # Directly display previous evaluation results
             evaluate_and_visualize(
                 st.session_state.trained_models,
                 st.session_state.X_train,
@@ -1228,16 +1189,14 @@ def main():
                 st.session_state.cv_folds
             )
             
-            # Download evaluation results
             if st.session_state.evaluation_results:
                 download_evaluation_results(
                     st.session_state.evaluation_results,
                     st.session_state.feature_names
                 )
         else:
-            # Evaluation button
-            if st.button("Start Evaluation", type="primary"):
-                with st.spinner("Evaluating models..."):
+            if st.button("Evaluate", type="primary"):
+                with st.spinner("Evaluating..."):
                     metrics, rank_df, evaluation_results = evaluate_and_visualize(
                         st.session_state.trained_models,
                         st.session_state.X_train,
@@ -1249,9 +1208,8 @@ def main():
                     )
                     
                     st.session_state.evaluation_results = evaluation_results
-                    st.success("Model evaluation completed!")
+                    st.success("Evaluation done!")
             
-            # Download evaluation results
             if st.session_state.evaluation_results:
                 download_evaluation_results(
                     st.session_state.evaluation_results,
@@ -1263,27 +1221,26 @@ def main():
         st.header("🔮 Predict New Data")
         
         if not st.session_state.trained_models:
-            st.warning("Please train models first!")
+            st.warning("Train models first!")
             return
         
-        st.write("Upload new data for prediction")
-        new_data_file = st.file_uploader("Select New Data File", type=['xlsx', 'csv'], key="new_data")
+        st.write("Upload new data")
+        new_data_file = st.file_uploader("Select File", type=['xlsx', 'csv'], key="new_data")
         
         if new_data_file is not None:
-            # Select models for prediction
             trained_model_names = list(st.session_state.trained_models.keys())
             selected_models_for_prediction = st.multiselect(
-                "Select Models for Prediction",
+                "Select Models",
                 trained_model_names,
                 default=trained_model_names
             )
             
-            if st.button("Start Prediction", type="primary"):
+            if st.button("Predict", type="primary"):
                 if not selected_models_for_prediction:
-                    st.error("Please select at least one model!")
+                    st.error("Select at least one model!")
                     return
                 
-                with st.spinner("Performing prediction..."):
+                with st.spinner("Predicting..."):
                     predict_new_dataset(
                         st.session_state.trained_models,
                         new_data_file,
@@ -1292,17 +1249,16 @@ def main():
     
     # Parameter Settings page
     elif current_page == "Parameter Settings":
-        st.header("⚙️ Parameter Settings")
+        st.header("⚙️ Parameters")
         
-        st.info("Set custom model parameters here")
+        st.info("Set custom parameters")
         
-        # Set parameters for each model
         model_options = ['XGBoost', 'Random Forest', 'SVM', 'Logistic Regression', 'Neural Network']
         
         custom_params = st.session_state.get('custom_params', {})
         
         for model in model_options:
-            with st.expander(f"{model} Parameters"):
+            with st.expander(f"{model}"):
                 if model == 'XGBoost':
                     n_estimators = st.slider("n_estimators", 50, 300, 100, key=f"xgb_n_est")
                     max_depth = st.slider("max_depth", 3, 10, 6, key=f"xgb_depth")
@@ -1345,36 +1301,52 @@ def main():
                 elif model == 'Logistic Regression':
                     C = st.slider("C", 0.1, 10.0, 1.0, key=f"lr_c")
                     penalty = st.selectbox("penalty", ['l1', 'l2'], key=f"lr_penalty")
+                    solver = st.selectbox("solver", 
+                                         ['liblinear', 'lbfgs', 'newton-cg', 'sag', 'saga'],
+                                         index=0,
+                                         key=f"lr_solver")
                     
                     custom_params[model] = {
                         'C': C,
                         'penalty': penalty,
-                        'solver': 'liblinear'
+                        'solver': solver
                     }
                 
                 elif model == 'Neural Network':
-                    hidden_layer_sizes = st.selectbox(
-                        "hidden_layer_sizes", 
-                        [(50,), (100,), (50, 30), (100, 50)],
-                        format_func=lambda x: f"{x}",
-                        key=f"nn_layers"
+                    st.write("**Hidden Layer Sizes**")
+                    st.info("Enter comma-separated values (e.g., '100,50,25' for 3 layers with 100, 50, and 25 neurons)")
+                    
+                    hidden_layer_input = st.text_input(
+                        "Hidden Layer Sizes",
+                        value="100,50",
+                        key=f"nn_layers_input",
+                        help="Format: comma-separated integers (e.g., '100,50' for two layers)"
                     )
+                    
+                    # Parse the input
+                    hidden_layer_sizes = parse_hidden_layer_sizes(hidden_layer_input)
+                    
+                    st.write(f"Parsed layer structure: {hidden_layer_sizes}")
+                    
                     alpha = st.slider("alpha", 0.0001, 0.1, 0.001, key=f"nn_alpha")
-                    activation = st.selectbox("activation", ['relu', 'tanh'], key=f"nn_act")
+                    activation = st.selectbox("activation", ['relu', 'tanh', 'logistic'], key=f"nn_act")
                     learning_rate_init = st.slider("learning_rate_init", 0.001, 0.01, 0.001, key=f"nn_lr")
+                    solver = st.selectbox("solver", ['lbfgs', 'sgd', 'adam'], key=f"nn_solver")
+                    batch_size = st.selectbox("batch_size", ['auto', 32, 64, 128], key=f"nn_batch")
                     
                     custom_params[model] = {
                         'hidden_layer_sizes': hidden_layer_sizes,
                         'alpha': alpha,
                         'activation': activation,
-                        'learning_rate_init': learning_rate_init
+                        'learning_rate_init': learning_rate_init,
+                        'solver': solver,
+                        'batch_size': batch_size
                     }
         
-        # Save custom parameters to session state
         st.session_state.custom_params = custom_params
         
-        if st.button("Save Parameters", type="primary"):
-            st.success("Parameters saved! You can now use custom parameters in the Model Training page.")
+        if st.button("Save", type="primary"):
+            st.success("Parameters saved!")
 
 if __name__ == "__main__":
     main()
