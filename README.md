@@ -1,4 +1,4 @@
-# 🪨 吴川川锆石成矿预测系统
+# 🪨 吴川川机器学习成矿潜力判别分类系统
 
 基于机器学习的锆石成矿预测Web应用。
 
@@ -12,4 +12,5 @@
 - Python
 - Streamlit
 - Scikit-learn
+
 - XGBoost
