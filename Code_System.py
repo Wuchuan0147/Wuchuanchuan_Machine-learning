@@ -34,7 +34,7 @@ warnings.filterwarnings('ignore')
 
 # Set page configuration
 st.set_page_config(
-    page_title="Zircon Mineralization Prediction System",
+    page_title="Machine learning Mineralization Potential discrimination System",
     page_icon="🔬",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -102,7 +102,7 @@ def create_evaluation_report(metrics_df, rank_df, models, feature_names, cv_fold
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     report_content = []
     
-    report_content.append(f"Zircon Mineralization Prediction Model Evaluation Report")
+    report_content.append(f"Zircon Mineralization potential Model Evaluation Report")
     report_content.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     report_content.append(f"Cross-validation folds: {cv_folds}")
     report_content.append("="*50)
