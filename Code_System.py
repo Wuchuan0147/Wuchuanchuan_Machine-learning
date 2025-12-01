@@ -862,7 +862,7 @@ def download_evaluation_results(evaluation_results, feature_names):
 def main():
     initialize_session_state()
     
-    st.title("🔬 Zircon Mineralization Prediction")
+    st.title("🔬 Machine learning Mineralization Potential discrimination System")
     st.markdown("---")
     
     # Sidebar navigation
@@ -932,7 +932,7 @@ def main():
     
     # Home page
     if current_page == "Home":
-        st.header("Zircon Mineralization Prediction System")
+        st.header("Machine learning Mineralization Potential discrimination System")
         st.markdown("""
         ### System Features
         
