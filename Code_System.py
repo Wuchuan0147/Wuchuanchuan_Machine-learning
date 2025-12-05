@@ -21,6 +21,11 @@ import io
 import base64
 from datetime import datetime
 import ast
+import hashlib
+import sqlite3
+import json
+import threading
+from pathlib import Path
 
 # Remove all Chinese font settings and use default English fonts
 plt.rcParams.update({
@@ -44,44 +49,248 @@ st.set_page_config(
 script_dir = os.path.dirname(os.path.abspath(__file__))
 os.chdir(script_dir)
 
+# ===============================
+# USER ISOLATION SYSTEM
+# ===============================
+
+def generate_user_id():
+    """Generate a unique user ID based on browser session"""
+    # Use Streamlit's internal session ID and timestamp
+    import time
+    session_id = st.runtime.scriptrunner.add_script_run_ctx().streamlit_script_run_ctx.session_id
+    timestamp = str(time.time())
+    unique_str = f"{session_id}_{timestamp}"
+    
+    # Create hash for user ID
+    user_id = hashlib.md5(unique_str.encode()).hexdigest()[:12]
+    
+    # Store in session state
+    if 'user_id' not in st.session_state:
+        st.session_state.user_id = user_id
+    
+    return st.session_state.user_id
+
+def get_user_workspace():
+    """Get user-specific workspace directory"""
+    user_id = generate_user_id()
+    user_dir = Path(f"user_data/{user_id}")
+    user_dir.mkdir(parents=True, exist_ok=True)
+    return str(user_dir), user_id
+
+def get_user_db_path():
+    """Get user-specific database path"""
+    workspace, user_id = get_user_workspace()
+    return os.path.join(workspace, f"user_{user_id}.db")
+
+def init_user_database():
+    """Initialize user-specific SQLite database"""
+    db_path = get_user_db_path()
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    # Create tables if they don't exist
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS user_models (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        model_name TEXT NOT NULL,
+        model_path TEXT NOT NULL,
+        parameters TEXT,
+        accuracy REAL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS user_data (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        data_type TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        file_hash TEXT,
+        rows INTEGER,
+        columns INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS user_predictions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        model_name TEXT NOT NULL,
+        input_file TEXT,
+        predictions TEXT,
+        metrics TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+def save_user_model(model_name, model_dict, accuracy=None):
+    """Save model info to user database"""
+    workspace, user_id = get_user_workspace()
+    db_path = get_user_db_path()
+    
+    # Save model file
+    model_filename = f"{model_name.replace(' ', '_')}_model.pkl"
+    model_path = os.path.join(workspace, model_filename)
+    joblib.dump(model_dict, model_path)
+    
+    # Save to database
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    parameters = json.dumps(model_dict.get('best_params', {}))
+    
+    cursor.execute('''
+    INSERT INTO user_models (model_name, model_path, parameters, accuracy)
+    VALUES (?, ?, ?, ?)
+    ''', (model_name, model_path, parameters, accuracy))
+    
+    conn.commit()
+    conn.close()
+    
+    return model_path
+
+def load_user_models():
+    """Load models from user database"""
+    workspace, user_id = get_user_workspace()
+    db_path = get_user_db_path()
+    
+    if not os.path.exists(db_path):
+        return {}
+    
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT model_name, model_path FROM user_models ORDER BY created_at DESC')
+    rows = cursor.fetchall()
+    conn.close()
+    
+    models = {}
+    for model_name, model_path in rows:
+        if os.path.exists(model_path):
+            try:
+                model_dict = joblib.load(model_path)
+                models[model_name] = model_dict
+            except Exception as e:
+                st.sidebar.warning(f"⚠️ {model_name}: {e}")
+    
+    return models
+
+def save_user_scaler(scaler):
+    """Save scaler for current user"""
+    workspace, user_id = get_user_workspace()
+    scaler_path = os.path.join(workspace, 'scaler.pkl')
+    joblib.dump(scaler, scaler_path)
+    return scaler_path
+
+def load_user_scaler():
+    """Load scaler for current user"""
+    workspace, user_id = get_user_workspace()
+    scaler_path = os.path.join(workspace, 'scaler.pkl')
+    if os.path.exists(scaler_path):
+        return joblib.load(scaler_path)
+    return None
+
+def save_user_best_model(model):
+    """Save best model for current user"""
+    workspace, user_id = get_user_workspace()
+    model_path = os.path.join(workspace, 'best_model.pkl')
+    joblib.dump(model, model_path)
+    return model_path
+
+def load_user_best_model():
+    """Load best model for current user"""
+    workspace, user_id = get_user_workspace()
+    model_path = os.path.join(workspace, 'best_model.pkl')
+    if os.path.exists(model_path):
+        return joblib.load(model_path)
+    return None
+
+def clear_user_data():
+    """Clear all data for current user"""
+    workspace, user_id = get_user_workspace()
+    
+    # Clear database
+    db_path = get_user_db_path()
+    if os.path.exists(db_path):
+        os.remove(db_path)
+    
+    # Clear workspace directory
+    import shutil
+    if os.path.exists(workspace):
+        shutil.rmtree(workspace)
+    
+    # Reinitialize
+    get_user_workspace()
+    init_user_database()
+    
+    return True
+
+# ===============================
+# END USER ISOLATION SYSTEM
+# ===============================
+
 # Initialize session state
 def initialize_session_state():
-    if 'trained_models' not in st.session_state:
-        st.session_state.trained_models = {}
-    if 'data_loaded' not in st.session_state:
-        st.session_state.data_loaded = False
-    if 'X_train' not in st.session_state:
-        st.session_state.X_train = None
-    if 'X_test' not in st.session_state:
-        st.session_state.X_test = None
-    if 'y_train' not in st.session_state:
-        st.session_state.y_train = None
-    if 'y_test' not in st.session_state:
-        st.session_state.y_test = None
-    if 'feature_names' not in st.session_state:
-        st.session_state.feature_names = None
-    if 'current_page' not in st.session_state:
-        st.session_state.current_page = "Home"
-    if 'uploaded_file' not in st.session_state:
-        st.session_state.uploaded_file = None
-    if 'custom_params' not in st.session_state:
-        st.session_state.custom_params = {}
-    if 'training_complete' not in st.session_state:
-        st.session_state.training_complete = False
-    if 'evaluation_results' not in st.session_state:
-        st.session_state.evaluation_results = None
+    # Initialize user isolation
+    workspace, user_id = get_user_workspace()
+    init_user_database()
+    
+    # User-specific session state
+    user_key_prefix = f"user_{user_id}_"
+    
+    if f'{user_key_prefix}trained_models' not in st.session_state:
+        st.session_state[f'{user_key_prefix}trained_models'] = {}
+    if f'{user_key_prefix}data_loaded' not in st.session_state:
+        st.session_state[f'{user_key_prefix}data_loaded'] = False
+    if f'{user_key_prefix}X_train' not in st.session_state:
+        st.session_state[f'{user_key_prefix}X_train'] = None
+    if f'{user_key_prefix}X_test' not in st.session_state:
+        st.session_state[f'{user_key_prefix}X_test'] = None
+    if f'{user_key_prefix}y_train' not in st.session_state:
+        st.session_state[f'{user_key_prefix}y_train'] = None
+    if f'{user_key_prefix}y_test' not in st.session_state:
+        st.session_state[f'{user_key_prefix}y_test'] = None
+    if f'{user_key_prefix}feature_names' not in st.session_state:
+        st.session_state[f'{user_key_prefix}feature_names'] = None
+    if f'{user_key_prefix}current_page' not in st.session_state:
+        st.session_state[f'{user_key_prefix}current_page'] = "Home"
+    if f'{user_key_prefix}uploaded_file' not in st.session_state:
+        st.session_state[f'{user_key_prefix}uploaded_file'] = None
+    if f'{user_key_prefix}custom_params' not in st.session_state:
+        st.session_state[f'{user_key_prefix}custom_params'] = {}
+    if f'{user_key_prefix}training_complete' not in st.session_state:
+        st.session_state[f'{user_key_prefix}training_complete'] = False
+    if f'{user_key_prefix}evaluation_results' not in st.session_state:
+        st.session_state[f'{user_key_prefix}evaluation_results'] = None
+    if f'{user_key_prefix}data_preprocessed' not in st.session_state:
+        st.session_state[f'{user_key_prefix}data_preprocessed'] = False
+    if f'{user_key_prefix}models_trained' not in st.session_state:
+        st.session_state[f'{user_key_prefix}models_trained'] = False
+    if f'{user_key_prefix}evaluation_done' not in st.session_state:
+        st.session_state[f'{user_key_prefix}evaluation_done'] = False
+    
+    # Global settings (shared but user can customize)
     if 'cv_folds' not in st.session_state:
         st.session_state.cv_folds = 5
-    if 'data_preprocessed' not in st.session_state:
-        st.session_state.data_preprocessed = False
-    if 'models_trained' not in st.session_state:
-        st.session_state.models_trained = False
-    if 'evaluation_done' not in st.session_state:
-        st.session_state.evaluation_done = False
     if 'test_size' not in st.session_state:
-        st.session_state.test_size = 0.3  # Default test size
+        st.session_state.test_size = 0.3
     if 'random_state' not in st.session_state:
-        st.session_state.random_state = 42  # Default random state
+        st.session_state.random_state = 42
+
+def get_user_session(key):
+    """Get user-specific session state value"""
+    workspace, user_id = get_user_workspace()
+    user_key = f"user_{user_id}_{key}"
+    return st.session_state.get(user_key)
+
+def set_user_session(key, value):
+    """Set user-specific session state value"""
+    workspace, user_id = get_user_workspace()
+    user_key = f"user_{user_id}_{key}"
+    st.session_state[user_key] = value
 
 # Helper functions
 def get_table_download_link(df, filename, link_text):
@@ -165,7 +374,8 @@ def load_and_preprocess_data(uploaded_file, test_size=0.3, random_state=42):
         X_train = scaler.fit_transform(X_train)
         X_test = scaler.transform(X_test)
         
-        joblib.dump(scaler, 'scaler.pkl')
+        # Save user-specific scaler
+        save_user_scaler(scaler)
         
         return X_train, X_test, y_train, y_test, feature_names, data.shape
     except Exception as e:
@@ -284,6 +494,10 @@ def train_models(X_train, y_train, selected_models, search_method, cv_folds, cus
             model.set_params(**params)
             model.fit(X_train, y_train)
             
+            # Calculate accuracy
+            y_train_pred = model.predict(X_train)
+            accuracy = accuracy_score(y_train, y_train_pred)
+            
             model_dict = {
                 'model': model,
                 'best_params': params,
@@ -291,6 +505,10 @@ def train_models(X_train, y_train, selected_models, search_method, cv_folds, cus
                 'train_metrics': {},
                 'cv_folds': cv_folds
             }
+            
+            # Save to user database
+            save_user_model(name, model_dict, accuracy)
+            
         else:
             if search_method == "Random Search":
                 search = RandomizedSearchCV(
@@ -337,6 +555,8 @@ def train_models(X_train, y_train, selected_models, search_method, cv_folds, cus
                 'f1': f1_score(y_train, y_train_pred, average='weighted')
             }
             
+            accuracy = train_metrics['accuracy']
+            
             model_dict = {
                 'model': model,
                 'best_params': search.best_params_,
@@ -344,16 +564,16 @@ def train_models(X_train, y_train, selected_models, search_method, cv_folds, cus
                 'train_metrics': train_metrics,
                 'cv_folds': cv_folds
             }
-        
-        model_filename = f"{name.replace(' ', '_')}_model.pkl"
-        joblib.dump(model_dict, model_filename)
+            
+            # Save to user database
+            save_user_model(name, model_dict, accuracy)
         
         trained_models[name] = model_dict
         progress_bar.progress((i + 1) / len(models))
     
     status_text.text("Training completed!")
-    st.session_state.training_complete = True
-    st.session_state.models_trained = True
+    set_user_session('training_complete', True)
+    set_user_session('models_trained', True)
     return trained_models
 
 # Plot confusion matrices
@@ -607,7 +827,8 @@ def evaluate_and_visualize(models, X_train, X_test, y_train, y_test, feature_nam
     best_model = models[best_model_name]['model']
     st.success(f"**Best Model: {best_model_name}** (Avg Rank {rank_df.loc[best_model_name, 'Average_Rank']:.2f})")
     
-    joblib.dump(best_model, 'best_model.pkl')
+    # Save best model for user
+    save_user_best_model(best_model)
     
     st.subheader("ROC Curves")
     roc_fig = plot_roc_curves(models, X_test, y_test)
@@ -630,8 +851,8 @@ def evaluate_and_visualize(models, X_train, X_test, y_train, y_test, feature_nam
         'cv_folds': cv_folds
     }
     
-    st.session_state.evaluation_results = evaluation_results
-    st.session_state.evaluation_done = True
+    set_user_session('evaluation_results', evaluation_results)
+    set_user_session('evaluation_done', True)
     
     return metrics_df, rank_df, evaluation_results
 
@@ -663,11 +884,14 @@ def predict_new_dataset(models, uploaded_file, selected_models_for_prediction):
         st.info("No Label column, prediction only.")
     
     try:
-        scaler = joblib.load('scaler.pkl')
+        scaler = load_user_scaler()
+        if scaler is None:
+            st.error("Scaler not found, train models first.")
+            return
         X_new_scaled = scaler.transform(X_new)
         st.success("Data standardized.")
-    except FileNotFoundError:
-        st.error("Scaler not found, train models first.")
+    except Exception as e:
+        st.error(f"Error loading scaler: {str(e)}")
         return
     
     for model_name in selected_models_for_prediction:
@@ -696,7 +920,8 @@ def predict_new_dataset(models, uploaded_file, selected_models_for_prediction):
             
             prediction_df = pd.concat([X_new.reset_index(drop=True), prediction_df], axis=1)
             
-            prediction_filename = f"{model_name.replace(' ', '_')}_predictions.csv"
+            workspace, user_id = get_user_workspace()
+            prediction_filename = f"{workspace}/{model_name.replace(' ', '_')}_predictions.csv"
             prediction_df.to_csv(prediction_filename, index=False)
             
             st.write(f"**Prediction Sample:**")
@@ -706,7 +931,7 @@ def predict_new_dataset(models, uploaded_file, selected_models_for_prediction):
             st.download_button(
                 label=f"Download {model_name} Results",
                 data=csv,
-                file_name=prediction_filename,
+                file_name=f"{model_name.replace(' ', '_')}_predictions.csv",
                 mime="text/csv"
             )
             
@@ -752,23 +977,37 @@ def predict_new_dataset(models, uploaded_file, selected_models_for_prediction):
         except Exception as e:
             st.error(f"Error with {model_name}: {str(e)}")
 
-# Load saved models
-def load_saved_models():
-    saved_models = {}
-    model_files = {
-        'XGBoost': 'XGBoost_model.pkl',
-        'Random Forest': 'Random_Forest_model.pkl', 
-        'SVM': 'SVM_model.pkl',
-        'Logistic Regression': 'Logistic_Regression_model.pkl',
-        'Neural Network': 'Neural_Network_model.pkl'
-    }
+# Load saved models for current user
+def load_user_saved_models():
+    """Load models for current user from database"""
+    workspace, user_id = get_user_workspace()
     
-    for model_name, filename in model_files.items():
-        if os.path.exists(filename):
+    # Get models from database
+    db_path = get_user_db_path()
+    if not os.path.exists(db_path):
+        return {}
+    
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    SELECT model_name, model_path, accuracy 
+    FROM user_models 
+    ORDER BY created_at DESC
+    ''')
+    
+    rows = cursor.fetchall()
+    conn.close()
+    
+    saved_models = {}
+    for model_name, model_path, accuracy in rows:
+        if os.path.exists(model_path):
             try:
-                model_dict = joblib.load(filename)
+                model_dict = joblib.load(model_path)
                 saved_models[model_name] = model_dict
-                st.sidebar.success(f"✅ {model_name}")
+                # Show status in sidebar
+                accuracy_str = f"{accuracy:.2%}" if accuracy else "N/A"
+                st.sidebar.success(f"✅ {model_name} ({accuracy_str})")
             except Exception as e:
                 st.sidebar.warning(f"⚠️ {model_name}: {e}")
         else:
@@ -862,6 +1101,12 @@ def download_evaluation_results(evaluation_results, feature_names):
 def main():
     initialize_session_state()
     
+    # Display user ID in sidebar for debugging
+    workspace, user_id = get_user_workspace()
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("👤 User Info")
+    st.sidebar.info(f"User ID: {user_id[:8]}...")
+    
     st.title("🔬 Machine learning Mineralization Potential discrimination System")
     st.markdown("---")
     
@@ -869,22 +1114,22 @@ def main():
     st.sidebar.title("🚀 Navigation")
     
     if st.sidebar.button("🏠 Home", use_container_width=True):
-        st.session_state.current_page = "Home"
+        set_user_session('current_page', "Home")
     
     if st.sidebar.button("📊 Data Upload", use_container_width=True):
-        st.session_state.current_page = "Data Upload"
+        set_user_session('current_page', "Data Upload")
     
     if st.sidebar.button("🤖 Model Training", use_container_width=True):
-        st.session_state.current_page = "Model Training"
+        set_user_session('current_page', "Model Training")
     
     if st.sidebar.button("📈 Model Evaluation", use_container_width=True):
-        st.session_state.current_page = "Model Evaluation"
+        set_user_session('current_page', "Model Evaluation")
     
     if st.sidebar.button("🔮 Predict New Data", use_container_width=True):
-        st.session_state.current_page = "Predict New Data"
+        set_user_session('current_page', "Predict New Data")
     
     if st.sidebar.button("⚙️ Parameters", use_container_width=True):
-        st.session_state.current_page = "Parameter Settings"
+        set_user_session('current_page', "Parameter Settings")
     
     st.sidebar.markdown("---")
     
@@ -901,34 +1146,42 @@ def main():
     
     st.sidebar.markdown("---")
     
-    # Load models
-    st.sidebar.subheader("📁 Models")
-    saved_models = load_saved_models()
+    # Load user models
+    st.sidebar.subheader("📁 Your Models")
+    saved_models = load_user_saved_models()
     if saved_models:
-        st.session_state.trained_models.update(saved_models)
-        st.sidebar.success(f"Loaded: {len(saved_models)}")
+        set_user_session('trained_models', saved_models)
+        st.sidebar.success(f"Loaded: {len(saved_models)} models")
     
-    # Clear data
+    # User-specific clear data
     st.sidebar.markdown("---")
-    if st.sidebar.button("🗑️ Clear All", type="secondary"):
-        for key in list(st.session_state.keys()):
-            del st.session_state[key]
-        initialize_session_state()
-        st.rerun()
+    if st.sidebar.button("🗑️ Clear My Data", type="secondary", help="Clear all data for current user only"):
+        if clear_user_data():
+            # Clear session state
+            for key in ['trained_models', 'data_loaded', 'X_train', 'X_test', 
+                       'y_train', 'y_test', 'feature_names', 'uploaded_file',
+                       'training_complete', 'evaluation_results', 'data_preprocessed',
+                       'models_trained', 'evaluation_done']:
+                set_user_session(key, None if key != 'trained_models' else {})
+            
+            set_user_session('current_page', "Home")
+            st.sidebar.success("Your data cleared!")
+            st.rerun()
     
     # Status
     st.sidebar.markdown("---")
-    st.sidebar.subheader("📊 Status")
+    st.sidebar.subheader("📊 Your Status")
     
     status_col1, status_col2 = st.sidebar.columns(2)
     with status_col1:
-        st.metric("Data", "✅" if st.session_state.data_loaded else "❌")
+        data_status = "✅" if get_user_session('data_loaded') else "❌"
+        st.metric("Data", data_status)
     with status_col2:
-        trained_count = len(st.session_state.trained_models)
+        trained_count = len(get_user_session('trained_models') or {})
         st.metric("Models", f"{trained_count}/5")
     
     # Page content
-    current_page = st.session_state.current_page
+    current_page = get_user_session('current_page') or "Home"
     
     # Home page
     if current_page == "Home":
@@ -937,19 +1190,16 @@ def main():
         ### System Features
         
         **📊 Data Upload** - Upload and preprocess zircon data
-        
         **🤖 Model Training** - Train machine learning models
-        - XGBoost
-        - Random Forest  
-        - SVM
-        - Logistic Regression
-        - Neural Network
-        
         **📈 Model Evaluation** - Evaluate and visualize model performance
-        
         **🔮 Predict New Data** - Predict on new datasets
-        
         **⚙️ Parameters** - Customize model parameters
+        
+        ### 🛡️ User Isolation System
+        - Each user has **completely isolated workspace**
+        - Your data, models, and results are **private to you**
+        - No interference between different users
+        - Automatic cleanup when you clear your data
         
         ### Usage Steps
         1. Upload data in "Data Upload"
@@ -959,35 +1209,36 @@ def main():
         
         ### Tips
         - Results are preserved between pages
-        - Use "Clear All" to restart
-        - Models are auto-saved
+        - Use "Clear My Data" to restart
+        - Models are auto-saved in your private workspace
         - Results can be downloaded
         """)
         
         col1, col2, col3 = st.columns(3)
         with col1:
-            status = "✅ Loaded" if st.session_state.data_loaded else "❌ Not Loaded"
-            st.metric("Data Status", status)
+            status = "✅ Loaded" if get_user_session('data_loaded') else "❌ Not Loaded"
+            st.metric("Your Data Status", status)
         with col2:
-            trained_count = len(st.session_state.trained_models)
-            st.metric("Models Trained", f"{trained_count}/5")
+            trained_count = len(get_user_session('trained_models') or {})
+            st.metric("Your Models Trained", f"{trained_count}/5")
         with col3:
-            status = "✅ Done" if st.session_state.training_complete else "⏳ Waiting"
-            st.metric("Training", status)
+            status = "✅ Done" if get_user_session('training_complete') else "⏳ Waiting"
+            st.metric("Training Status", status)
         
         st.info(f"Cross-validation: **{st.session_state.cv_folds}-fold**")
         st.info(f"Test set size: **{st.session_state.test_size*100}%**")
+        st.info(f"👤 Your User ID: **{user_id[:8]}...**")
     
     # Data Upload page
     elif current_page == "Data Upload":
         st.header("📊 Data Upload")
-        st.markdown("Upload zircon data (Excel/CSV)")
+        st.markdown("Upload your data (Excel/CSV)")
         
-        if st.session_state.data_loaded:
-            st.success("✅ Data loaded")
-            st.write(f"- Train: {st.session_state.X_train.shape[0]}")
-            st.write(f"- Test: {st.session_state.X_test.shape[0]}")
-            st.write(f"- Features: {len(st.session_state.feature_names)}")
+        if get_user_session('data_loaded'):
+            st.success("✅ Your data loaded")
+            st.write(f"- Train: {get_user_session('X_train').shape[0]}")
+            st.write(f"- Test: {get_user_session('X_test').shape[0]}")
+            st.write(f"- Features: {len(get_user_session('feature_names'))}")
             st.info(f"Test set size: **{st.session_state.test_size*100}%**")
         
         # Data split settings
@@ -1018,10 +1269,10 @@ def main():
         
         st.info(f"Training set: **{(1-st.session_state.test_size)*100}%** | Test set: **{st.session_state.test_size*100}%**")
         
-        uploaded_file = st.file_uploader("Select File", type=['xlsx', 'csv'])
+        uploaded_file = st.file_uploader("Select Your File", type=['xlsx', 'csv'])
         
         if uploaded_file is not None:
-            st.session_state.uploaded_file = uploaded_file
+            set_user_session('uploaded_file', uploaded_file)
             
             try:
                 if uploaded_file.name.endswith('.xlsx'):
@@ -1057,8 +1308,8 @@ def main():
                     st.pyplot(fig)
                     plt.close()
                 
-                if st.button("Preprocess Data", type="primary"):
-                    with st.spinner("Processing..."):
+                if st.button("Preprocess Your Data", type="primary"):
+                    with st.spinner("Processing your data..."):
                         X_train, X_test, y_train, y_test, feature_names, data_shape = load_and_preprocess_data(
                             uploaded_file, 
                             test_size=st.session_state.test_size,
@@ -1066,15 +1317,15 @@ def main():
                         )
                         
                         if X_train is not None:
-                            st.session_state.X_train = X_train
-                            st.session_state.X_test = X_test
-                            st.session_state.y_train = y_train
-                            st.session_state.y_test = y_test
-                            st.session_state.feature_names = feature_names
-                            st.session_state.data_loaded = True
-                            st.session_state.data_preprocessed = True
+                            set_user_session('X_train', X_train)
+                            set_user_session('X_test', X_test)
+                            set_user_session('y_train', y_train)
+                            set_user_session('y_test', y_test)
+                            set_user_session('feature_names', feature_names)
+                            set_user_session('data_loaded', True)
+                            set_user_session('data_preprocessed', True)
                             
-                            st.success("Data processed!")
+                            st.success("Your data processed!")
                             st.write(f"- Training set: {X_train.shape[0]} samples ({(1-st.session_state.test_size)*100:.1f}%)")
                             st.write(f"- Test set: {X_test.shape[0]} samples ({st.session_state.test_size*100:.1f}%)")
                             st.write(f"- Features: {len(feature_names)}")
@@ -1100,8 +1351,8 @@ def main():
         st.info(f"CV: **{st.session_state.cv_folds}-fold**")
         st.info(f"Test set size: **{st.session_state.test_size*100}%**")
         
-        if not st.session_state.data_loaded:
-            st.warning("Upload data first!")
+        if not get_user_session('data_loaded'):
+            st.warning("Upload your data first!")
             return
         
         st.write("**Select models:**")
@@ -1118,51 +1369,55 @@ def main():
             ["Random Search", "Grid Search", "Custom Parameters"]
         )
         
-        if st.session_state.trained_models:
-            st.info(f"📁 Loaded: {len(st.session_state.trained_models)} models")
-            trained_list = list(st.session_state.trained_models.keys())
-            st.write(f"Trained: {', '.join(trained_list)}")
+        user_trained_models = get_user_session('trained_models') or {}
+        if user_trained_models:
+            st.info(f"📁 Your loaded models: {len(user_trained_models)}")
+            trained_list = list(user_trained_models.keys())
+            st.write(f"Your trained models: {', '.join(trained_list)}")
         
         col1, col2 = st.columns(2)
         with col1:
-            use_existing = st.checkbox("Use existing models", value=True)
+            use_existing = st.checkbox("Use your existing models", value=True)
         with col2:
             retrain = st.checkbox("Retrain selected", value=False)
         
-        if st.button("Train Models", type="primary"):
+        if st.button("Train Your Models", type="primary"):
             if not selected_models:
                 st.error("Select at least one model!")
                 return
             
-            with st.spinner("Training..."):
+            with st.spinner("Training your models..."):
                 models_to_train = selected_models
                 if use_existing and not retrain:
-                    existing_models = list(st.session_state.trained_models.keys())
+                    existing_models = list(user_trained_models.keys())
                     models_to_train = [model for model in selected_models if model not in existing_models]
                     
                     if not models_to_train:
-                        st.info("Using existing models.")
+                        st.info("Using your existing models.")
                     else:
-                        st.info(f"New models: {', '.join(models_to_train)}")
+                        st.info(f"New models to train: {', '.join(models_to_train)}")
                 
                 if models_to_train or retrain:
-                    custom_params = {}
+                    custom_params = get_user_session('custom_params') or {}
                     if search_method == "Custom Parameters":
-                        custom_params = st.session_state.get('custom_params', {})
+                        custom_params = custom_params  # Already loaded from user session
                     
                     trained_models = train_models(
-                        st.session_state.X_train, 
-                        st.session_state.y_train, 
+                        get_user_session('X_train'), 
+                        get_user_session('y_train'), 
                         models_to_train if not retrain else selected_models, 
                         search_method,
                         st.session_state.cv_folds,
                         custom_params
                     )
                     
-                    st.session_state.trained_models.update(trained_models)
-                    st.success(f"Trained {len(trained_models)} models")
+                    # Update user's trained models
+                    current_models = get_user_session('trained_models') or {}
+                    current_models.update(trained_models)
+                    set_user_session('trained_models', current_models)
+                    st.success(f"Trained {len(trained_models)} models for you")
                 else:
-                    st.success("Using existing models")
+                    st.success("Using your existing models")
     
     # Model Evaluation page
     elif current_page == "Model Evaluation":
@@ -1171,100 +1426,104 @@ def main():
         st.info(f"CV: **{st.session_state.cv_folds}-fold**")
         st.info(f"Test set size: **{st.session_state.test_size*100}%**")
         
-        if not st.session_state.trained_models:
-            st.warning("Train models first!")
+        user_trained_models = get_user_session('trained_models') or {}
+        if not user_trained_models:
+            st.warning("Train your models first!")
             return
         
-        if st.session_state.evaluation_done:
-            st.success("✅ Evaluation done")
-            st.write("Previous results:")
+        if get_user_session('evaluation_done'):
+            st.success("✅ Your evaluation done")
+            st.write("Your previous results:")
             
             evaluate_and_visualize(
-                st.session_state.trained_models,
-                st.session_state.X_train,
-                st.session_state.X_test,
-                st.session_state.y_train,
-                st.session_state.y_test,
-                st.session_state.feature_names,
+                user_trained_models,
+                get_user_session('X_train'),
+                get_user_session('X_test'),
+                get_user_session('y_train'),
+                get_user_session('y_test'),
+                get_user_session('feature_names'),
                 st.session_state.cv_folds
             )
             
-            if st.session_state.evaluation_results:
+            user_eval_results = get_user_session('evaluation_results')
+            if user_eval_results:
                 download_evaluation_results(
-                    st.session_state.evaluation_results,
-                    st.session_state.feature_names
+                    user_eval_results,
+                    get_user_session('feature_names')
                 )
         else:
-            if st.button("Evaluate", type="primary"):
-                with st.spinner("Evaluating..."):
+            if st.button("Evaluate Your Models", type="primary"):
+                with st.spinner("Evaluating your models..."):
                     metrics, rank_df, evaluation_results = evaluate_and_visualize(
-                        st.session_state.trained_models,
-                        st.session_state.X_train,
-                        st.session_state.X_test,
-                        st.session_state.y_train,
-                        st.session_state.y_test,
-                        st.session_state.feature_names,
+                        user_trained_models,
+                        get_user_session('X_train'),
+                        get_user_session('X_test'),
+                        get_user_session('y_train'),
+                        get_user_session('y_test'),
+                        get_user_session('feature_names'),
                         st.session_state.cv_folds
                     )
                     
-                    st.session_state.evaluation_results = evaluation_results
-                    st.success("Evaluation done!")
+                    set_user_session('evaluation_results', evaluation_results)
+                    st.success("Your evaluation done!")
             
-            if st.session_state.evaluation_results:
+            user_eval_results = get_user_session('evaluation_results')
+            if user_eval_results:
                 download_evaluation_results(
-                    st.session_state.evaluation_results,
-                    st.session_state.feature_names
+                    user_eval_results,
+                    get_user_session('feature_names')
                 )
     
     # Predict New Data page
     elif current_page == "Predict New Data":
         st.header("🔮 Predict New Data")
         
-        if not st.session_state.trained_models:
-            st.warning("Train models first!")
+        user_trained_models = get_user_session('trained_models') or {}
+        if not user_trained_models:
+            st.warning("Train your models first!")
             return
         
-        st.write("Upload new data")
-        new_data_file = st.file_uploader("Select File", type=['xlsx', 'csv'], key="new_data")
+        st.write("Upload new data for prediction")
+        new_data_file = st.file_uploader("Select Your File", type=['xlsx', 'csv'], key="new_data")
         
         if new_data_file is not None:
-            trained_model_names = list(st.session_state.trained_models.keys())
+            trained_model_names = list(user_trained_models.keys())
             selected_models_for_prediction = st.multiselect(
-                "Select Models",
+                "Select Your Models",
                 trained_model_names,
                 default=trained_model_names
             )
             
-            if st.button("Predict", type="primary"):
+            if st.button("Predict with Your Models", type="primary"):
                 if not selected_models_for_prediction:
                     st.error("Select at least one model!")
                     return
                 
-                with st.spinner("Predicting..."):
+                with st.spinner("Predicting with your models..."):
                     predict_new_dataset(
-                        st.session_state.trained_models,
+                        user_trained_models,
                         new_data_file,
                         selected_models_for_prediction
                     )
     
     # Parameter Settings page
     elif current_page == "Parameter Settings":
-        st.header("⚙️ Parameters")
+        st.header("⚙️ Your Parameters")
         
-        st.info("Set custom parameters")
+        st.info("Set your custom parameters")
         
         model_options = ['XGBoost', 'Random Forest', 'SVM', 'Logistic Regression', 'Neural Network']
         
-        custom_params = st.session_state.get('custom_params', {})
+        custom_params = get_user_session('custom_params') or {}
         
         for model in model_options:
             with st.expander(f"{model}"):
                 if model == 'XGBoost':
-                    n_estimators = st.slider("n_estimators", 50, 300, 100, key=f"xgb_n_est")
-                    max_depth = st.slider("max_depth", 3, 10, 6, key=f"xgb_depth")
-                    learning_rate = st.slider("learning_rate", 0.01, 0.3, 0.1, key=f"xgb_lr")
-                    subsample = st.slider("subsample", 0.6, 1.0, 0.8, key=f"xgb_sub")
-                    colsample_bytree = st.slider("colsample_bytree", 0.6, 1.0, 0.8, key=f"xgb_col")
+                    n_estimators = st.slider("n_estimators", 50, 300, 100, key=f"xgb_n_est_{user_id}")
+                    max_depth = st.slider("max_depth", 3, 10, 6, key=f"xgb_depth_{user_id}")
+                    learning_rate = st.slider("learning_rate", 0.01, 0.3, 0.1, key=f"xgb_lr_{user_id}")
+                    subsample = st.slider("subsample", 0.6, 1.0, 0.8, key=f"xgb_sub_{user_id}")
+                    colsample_bytree = st.slider("colsample_bytree", 0.6, 1.0, 0.8, key=f"xgb_col_{user_id}")
                     
                     custom_params[model] = {
                         'n_estimators': n_estimators,
@@ -1275,10 +1534,10 @@ def main():
                     }
                 
                 elif model == 'Random Forest':
-                    n_estimators = st.slider("n_estimators", 50, 300, 100, key=f"rf_n_est")
-                    max_depth = st.slider("max_depth", 3, 20, 10, key=f"rf_depth")
-                    min_samples_split = st.slider("min_samples_split", 2, 10, 2, key=f"rf_split")
-                    min_samples_leaf = st.slider("min_samples_leaf", 1, 5, 1, key=f"rf_leaf")
+                    n_estimators = st.slider("n_estimators", 50, 300, 100, key=f"rf_n_est_{user_id}")
+                    max_depth = st.slider("max_depth", 3, 20, 10, key=f"rf_depth_{user_id}")
+                    min_samples_split = st.slider("min_samples_split", 2, 10, 2, key=f"rf_split_{user_id}")
+                    min_samples_leaf = st.slider("min_samples_leaf", 1, 5, 1, key=f"rf_leaf_{user_id}")
                     
                     custom_params[model] = {
                         'n_estimators': n_estimators,
@@ -1288,9 +1547,9 @@ def main():
                     }
                 
                 elif model == 'SVM':
-                    C = st.slider("C", 0.1, 10.0, 1.0, key=f"svm_c")
-                    gamma = st.slider("gamma", 0.01, 1.0, 0.1, key=f"svm_gamma")
-                    kernel = st.selectbox("kernel", ['linear', 'rbf', 'poly'], key=f"svm_kernel")
+                    C = st.slider("C", 0.1, 10.0, 1.0, key=f"svm_c_{user_id}")
+                    gamma = st.slider("gamma", 0.01, 1.0, 0.1, key=f"svm_gamma_{user_id}")
+                    kernel = st.selectbox("kernel", ['linear', 'rbf', 'poly'], key=f"svm_kernel_{user_id}")
                     
                     custom_params[model] = {
                         'C': C,
@@ -1299,12 +1558,12 @@ def main():
                     }
                 
                 elif model == 'Logistic Regression':
-                    C = st.slider("C", 0.1, 10.0, 1.0, key=f"lr_c")
-                    penalty = st.selectbox("penalty", ['l1', 'l2'], key=f"lr_penalty")
+                    C = st.slider("C", 0.1, 10.0, 1.0, key=f"lr_c_{user_id}")
+                    penalty = st.selectbox("penalty", ['l1', 'l2'], key=f"lr_penalty_{user_id}")
                     solver = st.selectbox("solver", 
                                          ['liblinear', 'lbfgs', 'newton-cg', 'sag', 'saga'],
                                          index=0,
-                                         key=f"lr_solver")
+                                         key=f"lr_solver_{user_id}")
                     
                     custom_params[model] = {
                         'C': C,
@@ -1319,7 +1578,7 @@ def main():
                     hidden_layer_input = st.text_input(
                         "Hidden Layer Sizes",
                         value="100,50",
-                        key=f"nn_layers_input",
+                        key=f"nn_layers_input_{user_id}",
                         help="Format: comma-separated integers (e.g., '100,50' for two layers)"
                     )
                     
@@ -1328,11 +1587,11 @@ def main():
                     
                     st.write(f"Parsed layer structure: {hidden_layer_sizes}")
                     
-                    alpha = st.slider("alpha", 0.0001, 0.1, 0.001, key=f"nn_alpha")
-                    activation = st.selectbox("activation", ['relu', 'tanh', 'logistic'], key=f"nn_act")
-                    learning_rate_init = st.slider("learning_rate_init", 0.001, 0.01, 0.001, key=f"nn_lr")
-                    solver = st.selectbox("solver", ['lbfgs', 'sgd', 'adam'], key=f"nn_solver")
-                    batch_size = st.selectbox("batch_size", ['auto', 32, 64, 128], key=f"nn_batch")
+                    alpha = st.slider("alpha", 0.0001, 0.1, 0.001, key=f"nn_alpha_{user_id}")
+                    activation = st.selectbox("activation", ['relu', 'tanh', 'logistic'], key=f"nn_act_{user_id}")
+                    learning_rate_init = st.slider("learning_rate_init", 0.001, 0.01, 0.001, key=f"nn_lr_{user_id}")
+                    solver = st.selectbox("solver", ['lbfgs', 'sgd', 'adam'], key=f"nn_solver_{user_id}")
+                    batch_size = st.selectbox("batch_size", ['auto', 32, 64, 128], key=f"nn_batch_{user_id}")
                     
                     custom_params[model] = {
                         'hidden_layer_sizes': hidden_layer_sizes,
@@ -1343,10 +1602,10 @@ def main():
                         'batch_size': batch_size
                     }
         
-        st.session_state.custom_params = custom_params
+        set_user_session('custom_params', custom_params)
         
-        if st.button("Save", type="primary"):
-            st.success("Parameters saved!")
+        if st.button("Save Your Parameters", type="primary"):
+            st.success("Your parameters saved!")
 
 if __name__ == "__main__":
     main()
